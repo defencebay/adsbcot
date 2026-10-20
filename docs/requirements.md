@@ -1,4 +1,4 @@
-ADSBCOT runs in any Python 3.6+ environment, including Windows, Linux & Raspberry Pi.
+ADSBCOT runs in any Python 3.9+ environment, including Windows, Linux & Raspberry Pi.
 
 Aircraft ADS-B data can be received & decoded from a variety of sources, and can run along-side dump1090 on a single computer, or on seperate computers connected over an IP network.
 

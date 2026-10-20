@@ -3,3 +3,6 @@ pytest-cov
 pylint
 flake8
 black
+pymodes >= 2.18, < 3
+asyncinotify
+mypy; python_version >= "3.10"

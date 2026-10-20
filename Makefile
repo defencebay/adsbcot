@@ -50,13 +50,13 @@ clean:
 		*/__pycache__ deb_dist .mypy_cache .pytest_cache
 
 pep8:
-	flake8 --max-line-length=88 --extend-ignore=E203 --exit-zero $(REPO_NAME)/*.py
+	flake8 --max-line-length=88 --extend-ignore=E203 src/$(REPO_NAME)
 
 flake8: pep8
 
 lint:
 	pylint --msg-template="{path}:{line}: [{msg_id}({symbol}), {obj}] {msg}" \
-		--max-line-length=88 -r n $(REPO_NAME)/*.py || exit 0
+		--max-line-length=88 -r n src/$(REPO_NAME) || exit 0
 
 pylint: lint
 
@@ -64,7 +64,7 @@ checkmetadata:
 	python3 setup.py check -s --restructuredtext
 
 mypy:
-	mypy --strict .
+	mypy
 
 pytest:
 	python3 -m pytest
@@ -72,7 +72,7 @@ pytest:
 test: editable install_test_requirements pytest
 
 test_cov:
-	python3 -m pytest --cov=$(REPO_NAME) --cov-report term-missing
+	python3 -m pytest --cov=$(REPO_NAME) --cov-report term-missing --cov-fail-under=90
 
 black:
 	black .

@@ -16,7 +16,7 @@ wget https://github.com/snstac/adsbcot/releases/latest/download/adsbcot_latest_a
 sudo apt install -f ./adsbcot_latest_all.deb
 ```
 
-> **N.B.** This installation method only supports `http://` & `file://` based ADS-B data feeds. To use TCP RAW (SBS-1) or TCP binary Beast protocols, you'll need to install pyModeS, see below.
+> **N.B.** This installation method only supports `http://` & `file://` based ADS-B data feeds. To use TCP raw (AVR) or TCP binary Beast feeds, you'll need to install pyModeS, see below.
 
 ## Windows, Linux
 
@@ -26,12 +26,20 @@ Install from the Python Package Index (PyPI) [Advanced Users]::
 sudo python3 -m pip install adsbcot
 ```
 
-## TCP BaseStation (SBS-1) & TCP binary Beast support
+## TCP raw & TCP binary Beast support
 
 If you'd like to read decoded ADS-B data over the network, you must install ADSBCOT with the extra pymodes package:
 
 ```sh
-sudo python3 -m pip install adsbcot[with_pymodes]
+sudo python3 -m pip install 'adsbcot[with_pymodes]'
+```
+
+ADSBCOT needs **pyModeS 2.x, version 2.18 or newer**. pyModeS 3 removed the
+streaming decoder ADSBCOT uses, and releases before 2.18 fail with
+``ValueError: too many values to unpack``. To fix an existing install:
+
+```sh
+sudo python3 -m pip install 'pymodes>=2.18,<3'
 ```
 
 ## ADSBExchange.com Raspberry Pi

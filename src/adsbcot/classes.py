@@ -25,15 +25,19 @@ import os
 import warnings
 
 from pathlib import Path
-from typing import Optional, Union
-from urllib.parse import ParseResult, ParseResultBytes, urlparse
+from typing import Any, Dict, List, Optional, Tuple, Union
+from configparser import SectionProxy
+from urllib.parse import ParseResult, urlparse
 
 import aiohttp
 import websockets
+import websockets.exceptions
 import pytak
 import aircot
 import adsbcot
 import xml.etree.ElementTree as ET
+
+from adsbcot.functions import _first
 
 try:
     import gpsd as _gpsd
@@ -73,16 +77,16 @@ class _NoStatus:
     rendering an empty feed as though the sky were empty.
     """
 
-    def count(self, *args, **kwargs) -> None:
+    def count(self, *args: Any, **kwargs: Any) -> None:
         return None
 
-    def record(self, *args, **kwargs) -> None:
+    def record(self, *args: Any, **kwargs: Any) -> None:
         return None
 
-    def set(self, *args, **kwargs) -> None:
+    def set(self, *args: Any, **kwargs: Any) -> None:
         return None
 
-    def write(self, *args, **kwargs) -> bool:
+    def write(self, *args: Any, **kwargs: Any) -> bool:
         return False
 
 
@@ -91,7 +95,7 @@ class _NoStatus:
 _StatusWriter = getattr(pytak, "StatusWriter", None)
 
 
-def make_status(app_name: str, version: str):
+def make_status(app_name: str, version: str) -> Any:
     """Return a status writer, or a no-op if this pytak has none."""
     if _StatusWriter is None:
         return _NoStatus()
@@ -99,15 +103,15 @@ def make_status(app_name: str, version: str):
 
 
 class ADSBWorker(pytak.QueueWorker):
-    """Process ADS-B data from various sources, convert to CoT, and enqueue for transmission."""
+    """Read ADS-B data from a feed, convert to CoT, and put on the TX queue."""
 
-    def __init__(self, queue, config) -> None:
+    def __init__(self, queue: "asyncio.Queue[Any]", config: SectionProxy) -> None:
         """Initialize this class."""
         super().__init__(queue, config)
-        self.known_craft_db: Optional[dict] = None
+        self.known_craft_db: Optional[Dict[str, Any]] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self.uid_key: str = self.config.get("UID_KEY", "ICAO")
-        self.altitudes: dict = {}
+        self.altitudes: Dict[str, float] = {}
 
         # Runtime status for Cockpit. systemd gives us /run/adsbcot via
         # RuntimeDirectory=, so this lands where the plugin looks for it.
@@ -135,7 +139,9 @@ class ADSBWorker(pytak.QueueWorker):
             await asyncio.sleep(interval)
             self.status.write(force=True)
 
-    async def handle_data(self, data: Union[list, dict]) -> None:
+    async def handle_data(
+        self, data: Union[List[Dict[str, Any]], Dict[str, Any]]
+    ) -> None:
         """Handle Data from ADS-B receiver: Render to CoT, put on TX queue."""
         if not data:
             self._logger.warning("Empty aircraft list")
@@ -158,7 +164,7 @@ class ADSBWorker(pytak.QueueWorker):
             icao = await self.process_craft(data)
             self._logger.debug("Handling ICAO: %s", icao)
 
-    async def process_craft(self, craft: dict) -> Optional[str]:
+    async def process_craft(self, craft: Dict[str, Any]) -> Optional[str]:
         """Process a single aircraft data dictionary.
         Parameters
         ----------
@@ -211,7 +217,8 @@ class ADSBWorker(pytak.QueueWorker):
                 self.status.write()
                 return None
 
-        known_craft: dict = aircot.get_known_craft(self.known_craft_db, icao, "HEX")
+        # Hex lookup only: the third argument is a registration, not a key name.
+        known_craft: Dict[str, Any] = aircot.get_known_craft(self.known_craft_db, icao)
 
         # Skip if we're using known_craft CSV and this Craft isn't found:
         if (
@@ -240,9 +247,9 @@ class ADSBWorker(pytak.QueueWorker):
         # dead antenna. The `placed` flag keeps both facts visible.
         self.status.record(
             icao=icao,
-            flight=str(craft.get("flight", craft.get("Tail", ""))).strip() or None,
-            alt=craft.get("alt_geom", craft.get("alt_baro")),
-            speed=craft.get("gs", craft.get("Speed")),
+            flight=str(_first(craft, "flight", "Tail", default="")).strip() or None,
+            alt=_first(craft, "alt_geom", "alt_baro"),
+            speed=_first(craft, "gs", "Speed"),
             placed=event is not None,
         )
 
@@ -258,7 +265,7 @@ class ADSBWorker(pytak.QueueWorker):
         await self.put_queue(event)
         return icao
 
-    def calc_altitude(self, craft: dict) -> dict:
+    def calc_altitude(self, craft: Dict[str, Any]) -> Dict[str, float]:
         """Calculate altitude based on barometric and geometric altitude."""
         alt_baro = craft.get("alt_baro", "")
         alt_geom = craft.get("alt_geom", "")
@@ -269,13 +276,13 @@ class ADSBWorker(pytak.QueueWorker):
         if alt_baro == "ground":
             return {}
 
-        alt_baro = float(alt_baro)
+        baro = float(alt_baro)
         if alt_geom:
             self.altitudes["alt_geom"] = float(alt_geom)
-            self.altitudes["alt_baro"] = alt_baro
+            self.altitudes["alt_baro"] = baro
         elif "alt_baro" in self.altitudes and "alt_geom" in self.altitudes:
             ref_alt_baro = float(self.altitudes["alt_baro"])
-            alt_baro_offset = alt_baro - ref_alt_baro
+            alt_baro_offset = baro - ref_alt_baro
             return {
                 "x_alt_baro_offset": alt_baro_offset,
                 "x_alt_geom": ref_alt_baro + alt_baro_offset,
@@ -283,7 +290,7 @@ class ADSBWorker(pytak.QueueWorker):
 
         return {}
 
-    async def get_feed(self, url: bytes) -> None:
+    async def get_feed(self, url: str) -> None:
         """Poll the ADS-B feed and pass data to the data handler."""
         if self.session is None or self.session.closed:
             self._logger.error("Session is closed, cannot proceed.")
@@ -325,9 +332,9 @@ class ADSBWorker(pytak.QueueWorker):
             )
             await self.handle_data(data)
 
-    async def get_file_feed(self, feed_url: ParseResultBytes) -> None:
+    async def get_file_feed(self, feed_url: ParseResult) -> None:
         """Read data from an aircraft JSON file."""
-        jdata: dict = {}
+        jdata: Dict[str, Any] = {}
         feed_data: str = ""
 
         with open(feed_url.path, "r", encoding="UTF-8") as feed_fd:
@@ -351,11 +358,11 @@ class ADSBWorker(pytak.QueueWorker):
         )
         await self.handle_data(data)
 
-    async def run(self, _=-1) -> None:
+    async def run(self, _: int = -1) -> None:
         """Run this Thread, Reads from Pollers."""
 
-        url: Optional[bytes] = self.config.get("FEED_URL")
-        if not url or url == "":
+        url: Optional[str] = self.config.get("FEED_URL")
+        if not url:
             raise ValueError("Please specify a FEED_URL.")
 
         poll_interval: Union[int, str, None] = self.config.get("POLL_INTERVAL")
@@ -370,10 +377,10 @@ class ADSBWorker(pytak.QueueWorker):
             "Running %s at %ss for %s", self.__class__, poll_interval, url
         )
 
-        known_craft: bytes = self.config.get("KNOWN_CRAFT", "")
-        if known_craft:
-            self._logger.info("Using KNOWN_CRAFT: %s", known_craft)
-            self.known_craft_db = aircot.read_known_craft(known_craft)
+        # Loaded in __init__ when the file exists; a missing file is not fatal.
+        known_craft: str = self.config.get("KNOWN_CRAFT", "")
+        if known_craft and not os.path.exists(known_craft):
+            self._logger.warning("KNOWN_CRAFT file not found: %s", known_craft)
 
         alt_upper: int = int(self.config.get("ALT_UPPER", "0"))
         alt_lower: int = int(self.config.get("ALT_LOWER", "0"))
@@ -382,7 +389,7 @@ class ADSBWorker(pytak.QueueWorker):
                 "Using Altitude Filters: Upper = %s, Lower = %s", alt_upper, alt_lower
             )
 
-        feed_url: ParseResultBytes = urlparse(url)
+        feed_url: ParseResult = urlparse(url)
 
         # Write once, before any aircraft arrive. Without this the management
         # UI shows "no status from this gateway" until the first contact --
@@ -397,7 +404,9 @@ class ADSBWorker(pytak.QueueWorker):
         finally:
             heartbeat.cancel()
 
-    async def _run_feed(self, url, feed_url: ParseResultBytes, poll_interval) -> None:
+    async def _run_feed(
+        self, url: str, feed_url: ParseResult, poll_interval: Union[int, str]
+    ) -> None:
         """Dispatch to the reader for this feed's URL scheme."""
         url_scheme = str(feed_url.scheme)
 
@@ -410,17 +419,34 @@ class ADSBWorker(pytak.QueueWorker):
                     await self.get_feed(url)
                     await asyncio.sleep(int(poll_interval))
         elif "ws" in url_scheme:
-            try:
-                async with websockets.connect(url) as websocket:
-                    self._logger.info("Connected to: %s", url)
-                    async for message in websocket:
-                        self._logger.debug("message=%s", message)
-                        if message:
-                            j_event = json.loads(message)
+            while True:
+                try:
+                    # websockets 10 exposes connect lazily, invisible to mypy.
+                    connect = getattr(websockets, "connect")
+                    async with connect(url) as websocket:
+                        self._logger.info("Connected to: %s", url)
+                        async for message in websocket:
+                            self._logger.debug("message=%s", message)
+                            if not message:
+                                continue
+                            try:
+                                j_event = json.loads(message)
+                            except ValueError:
+                                self._logger.warning("Skipping non-JSON message")
+                                continue
                             await self.handle_data(j_event)
-            except websockets.exceptions.ConnectionClosedError:
-                self._logger.warning("Websocket closed, reconnecting...")
-                await asyncio.sleep(2)
+                except (
+                    websockets.exceptions.ConnectionClosed,
+                    websockets.exceptions.InvalidHandshake,
+                    asyncio.TimeoutError,
+                    OSError,
+                ) as exc:
+                    self._logger.warning("Websocket error: %r", exc)
+                self._logger.warning(
+                    "Websocket closed, reconnecting in %ss",
+                    adsbcot.DEFAULT_RECONNECT_DELAY,
+                )
+                await asyncio.sleep(adsbcot.DEFAULT_RECONNECT_DELAY)
         elif "file" in url_scheme:
             if importlib.util.find_spec("asyncinotify") is None:
                 self._logger.info("asyncinotify not installed, using file polling.")
@@ -449,20 +475,24 @@ class ADSBNetWorker(ADSBWorker):
     """Read ADS-B Data from network, renders to COT, and puts on queue."""
 
     def __init__(
-        self, queue, net_queue, config, data_type
-    ):  # NOQA pylint: disable=too-many-arguments
+        self,
+        queue: "asyncio.Queue[Any]",
+        net_queue: "asyncio.Queue[bytes]",
+        config: SectionProxy,
+        data_type: str,
+    ) -> None:  # NOQA pylint: disable=too-many-arguments
         """Initialize this class."""
         super().__init__(queue, config)
         self.net_queue = net_queue
         self.config = config
         self.data_type = data_type
 
-        self.local_buffer_adsb_msg = []
-        self.local_buffer_adsb_ts = []
-        self.local_buffer_commb_msg = []
-        self.local_buffer_commb_ts = []
+        self.local_buffer_adsb_msg: List[str] = []
+        self.local_buffer_adsb_ts: List[float] = []
+        self.local_buffer_commb_msg: List[str] = []
+        self.local_buffer_commb_ts: List[float] = []
 
-    def _reset_local_buffer(self):
+    def _reset_local_buffer(self) -> None:
         """Reset Socket Buffers."""
         self.local_buffer_adsb_msg = []
         self.local_buffer_adsb_ts = []
@@ -470,7 +500,7 @@ class ADSBNetWorker(ADSBWorker):
         self.local_buffer_commb_ts = []
 
     async def run(
-        self, _=-1
+        self, _: int = -1
     ) -> None:  # NOQA pylint: disable=too-many-locals, too-many-branches
         """Run the main process loop."""
         self._logger.info(
@@ -495,7 +525,7 @@ class ADSBNetWorker(ADSBWorker):
         finally:
             heartbeat.cancel()
 
-    async def _run_decoder(self, decoder, net_client) -> None:
+    async def _run_decoder(self, decoder: Any, net_client: Any) -> None:
         """Read framed Mode S from the network queue and decode to aircraft."""
         while 1:
             messages = []
@@ -554,13 +584,13 @@ class ADSBNetWorker(ADSBWorker):
             # a time so the status surface can report how many aircraft the
             # decoder currently holds. Per-craft calls would each report a
             # "tracked" count of 1, which is a number, just not a true one.
-            crafts: list = []
+            crafts: List[Dict[str, Any]] = []
             for key, val in acs.items():
-                _data: dict = {
+                _data: Dict[str, Any] = {
                     "hex": key,
                     "lat": val.get("lat"),
                     "lon": val.get("lon"),
-                    "flight": val.get("call", key).replace("_", ""),
+                    "flight": (val.get("call") or key).replace("_", ""),
                     "alt_geom": val.get("alt"),
                     "gs": val.get("gs"),
                     "reg": val.get("r"),
@@ -576,21 +606,23 @@ class ADSBNetWorker(ADSBWorker):
 class ADSBNetReceiver(pytak.QueueWorker):  # pylint: disable=too-few-public-methods
     """Read ADS-B Data from network and puts on queue."""
 
-    def __init__(self, queue, config, data_type) -> None:
+    def __init__(
+        self, queue: "asyncio.Queue[bytes]", config: SectionProxy, data_type: str
+    ) -> None:
         """Initialize this class."""
         super().__init__(queue, config)
         self.data_type: str = data_type
 
-    async def run(self, _=-1) -> None:
+    async def run(self, _: int = -1) -> None:
         """Run the main process loop."""
         url: ParseResult = urlparse(self.config.get("FEED_URL"))
 
         self._logger.info("Running %s for %s", self.__class__, url.geturl())
 
-        if ":" in url.netloc:
-            host, port = url.netloc.split(":")
-        else:
-            host = url.netloc
+        # hostname/port rather than splitting netloc, so [IPv6]:port works.
+        host = url.hostname
+        port = url.port
+        if port is None:
             if self.data_type == "raw":
                 port = adsbcot.DEFAULT_TCP_RAW_PORT
             elif self.data_type == "beast":
@@ -600,26 +632,55 @@ class ADSBNetReceiver(pytak.QueueWorker):  # pylint: disable=too-few-public-meth
 
         self._logger.debug("host=%s port=%s", host, port)
 
-        reader, _ = await asyncio.open_connection(host, port)
+        while True:
+            try:
+                reader, writer = await asyncio.open_connection(host, port)
+            except OSError as exc:
+                self._logger.warning(
+                    "Unable to connect to %s:%s: %s", host, port, exc
+                )
+            else:
+                try:
+                    await self._read(reader)
+                    self._logger.warning("Connection to %s:%s closed.", host, port)
+                except (OSError, ValueError) as exc:
+                    # ValueError: readline() found no newline within its limit,
+                    # e.g. tcp+raw pointed at a Beast port.
+                    self._logger.warning(
+                        "Error reading from %s:%s: %r", host, port, exc
+                    )
+                finally:
+                    writer.close()
 
-        if self.data_type == "raw":
-            while 1:
+            # Without this a dropped decoder ended the task (or, at EOF, spun
+            # on empty reads and starved every other task) until restart.
+            self._logger.info("Reconnecting in %ss", adsbcot.DEFAULT_RECONNECT_DELAY)
+            await asyncio.sleep(adsbcot.DEFAULT_RECONNECT_DELAY)
+
+    async def _read(self, reader: asyncio.StreamReader) -> None:
+        """Queue data from `reader` until the peer closes the connection.
+
+        At EOF readline()/read() return b"" at once, without yielding to the
+        event loop, so EOF must end the loop rather than be queued.
+        """
+        while True:
+            if self.data_type == "raw":
                 received = await reader.readline()
-                self.queue.put_nowait(received)
-        elif self.data_type == "beast":
-            while 1:
+            else:
                 received = await reader.read(4096)
-                self.queue.put_nowait(received)
+            if not received:
+                return
+            self.queue.put_nowait(received)
 
 
 class xFileWatcher(pytak.QueueWorker):
     """Read ADS-B Data from a file, serialize to CoT, and put on TX queue."""
 
-    def __init__(self, queue, config) -> None:
+    def __init__(self, queue: "asyncio.Queue[Any]", config: SectionProxy) -> None:
         """Initialize this class."""
         super().__init__(queue, config)
-        self.known_craft_db = None
-        self.session = None
+        self.known_craft_db: Optional[Dict[str, Any]] = None
+        self.session: Optional[aiohttp.ClientSession] = None
         self.uid_key: str = self.config.get("UID_KEY", "ICAO")
 
         known_craft = self.config.get("KNOWN_CRAFT")
@@ -627,7 +688,7 @@ class xFileWatcher(pytak.QueueWorker):
             self._logger.info("Using KNOWN_CRAFT: %s", known_craft)
             self.known_craft_db = aircot.read_known_craft(known_craft)
 
-    async def handle_data(self, data: list) -> None:
+    async def handle_data(self, data: List[Dict[str, Any]]) -> None:
         """Handle Data from ADS-B receiver: Render to CoT, put on TX queue.
 
         Parameters
@@ -664,7 +725,9 @@ class xFileWatcher(pytak.QueueWorker):
                 if self.config.getboolean("TISB_ONLY"):
                     continue
 
-            known_craft: dict = aircot.get_known_craft(self.known_craft_db, icao, "HEX")
+            known_craft: Dict[str, Any] = aircot.get_known_craft(
+                self.known_craft_db, icao
+            )
 
             # Skip if we're using known_craft CSV and this Craft isn't found:
             if (
@@ -685,7 +748,7 @@ class xFileWatcher(pytak.QueueWorker):
             self._logger.debug("Handling %s/%s ICAO: %s", i, lod, icao)
             await self.put_queue(event)
 
-    async def get_feed(self, url: bytes) -> None:
+    async def get_feed(self, url: str) -> None:
         """Poll the ADS-B feed and pass data to the data handler."""
         if not self.session:
             self._logger.warning("No aiohttp session available.")
@@ -711,16 +774,16 @@ class xFileWatcher(pytak.QueueWorker):
             )
             await self.handle_data(data)
 
-    async def run(self, _=-1) -> None:
+    async def run(self, _: int = -1) -> None:
         """Run this Thread, Reads from Pollers."""
-        url: bytes = self.config.get("FEED_URL", adsbcot.DEFAULT_FEED_URL)
+        url: str = self.config.get("FEED_URL", adsbcot.DEFAULT_FEED_URL)
         if not url:
             raise ValueError("Please specify a FEED_URL.")
 
         self._logger.info("Running %s", self.__class__)
 
-        known_craft: bytes = self.config.get("KNOWN_CRAFT", "")
-        poll_interval: bytes = self.config.get(
+        known_craft: str = self.config.get("KNOWN_CRAFT", "")
+        poll_interval: Union[int, str] = self.config.get(
             "POLL_INTERVAL", adsbcot.DEFAULT_POLL_INTERVAL
         )
 
@@ -737,14 +800,23 @@ class xFileWatcher(pytak.QueueWorker):
                 await asyncio.sleep(int(poll_interval))
 
 
-class SensorWorker(pytak.QueueWorker):
-    """Periodic sensor CoT heartbeat. Sources position from gpsd, config, or null island."""
+# lat, lon, hae, ce, le
+Position = Tuple[float, float, float, str, str]
 
-    async def run(self, _=-1) -> None:
-        period = int(self.config.get(
-            "SENSOR_KEEPALIVE_PERIOD", adsbcot.DEFAULT_SENSOR_KEEPALIVE_PERIOD))
+
+class SensorWorker(pytak.QueueWorker):
+    """Periodic sensor CoT heartbeat. Position from gpsd, config, or null island."""
+
+    async def run(self, _: int = -1) -> None:
+        """Send a sensor beacon every SENSOR_KEEPALIVE_PERIOD seconds."""
+        period = int(
+            self.config.get(
+                "SENSOR_KEEPALIVE_PERIOD", adsbcot.DEFAULT_SENSOR_KEEPALIVE_PERIOD
+            )
+        )
         self._logger.info(
-            "Running SensorWorker (period=%ds, gpsd=%s)", period, _gpsd is not None)
+            "Running SensorWorker (period=%ds, gpsd=%s)", period, _gpsd is not None
+        )
         while True:
             lat, lon, hae, ce, le = await self._get_position()
             cot = adsbcot.gen_sensor_cot(self.config, lat, lon, hae, ce, le)
@@ -752,7 +824,7 @@ class SensorWorker(pytak.QueueWorker):
                 await self.put_queue(ET.tostring(cot))
             await asyncio.sleep(period)
 
-    async def _get_position(self):
+    async def _get_position(self) -> Position:
         if _gpsd is not None:
             try:
                 result = await asyncio.to_thread(self._poll_gpsd)
@@ -766,7 +838,7 @@ class SensorWorker(pytak.QueueWorker):
         return lat, lon, hae, "9999999.0", "9999999.0"
 
     @staticmethod
-    def _poll_gpsd():
+    def _poll_gpsd() -> Optional[Position]:
         _gpsd.connect()
         packet = _gpsd.get_current()
         if packet.mode < 2:

@@ -19,14 +19,16 @@
 """ADSBCOT Functions."""
 
 import asyncio
-import importlib.util
+import importlib
+import importlib.metadata
 import logging
 import os
+import re
 import warnings
 import xml.etree.ElementTree as ET
 
 from configparser import SectionProxy
-from typing import Optional, Set, Union
+from typing import Any, Dict, Optional, Set, Union
 from urllib.parse import ParseResult, urlparse
 
 import aircot
@@ -41,18 +43,98 @@ except ImportError as exc:
     warnings.warn("ADSBCOT ignoring ImportError for: pyModeS")
 
 
+# Stratux TargetType values, see cyoung/stratux main/traffic.go.
+TARGET_TYPE_NAMES: Dict[int, str] = {
+    0: "Mode S",
+    1: "ADS-B",
+    2: "ADS-R",
+    3: "TIS-B S",
+    4: "TIS-B",
+}
+
+# A configparser section, or a plain dict in tests and library use.
+Config = Union[SectionProxy, Dict[str, Any]]
+
 APP_NAME = "adsbcot"
 Logger = logging.getLogger(__name__)
 Debug = bool(os.getenv("DEBUG", False))
 
 
-def sensor_beacon_enabled(config: Union[SectionProxy, dict]) -> bool:
+def _first(craft: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Return the value of the first of `keys` present in `craft` and not None.
+
+    Feeds send JSON ``null`` for fields they have not decoded yet, and
+    ``dict.get(key, default)`` returns that None instead of the default (#24).
+    """
+    for key in keys:
+        value = craft.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _text(value: Any) -> str:
+    """Normalize a craft text field; None is empty, not the word "NONE"."""
+    if value is None:
+        return ""
+    return str(value).strip().upper()
+
+
+def _number(value: Any) -> Optional[float]:
+    """Return `value` as a float, or None if it is null or not numeric."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Data types ADSBNetWorker can decode; pyModeS exits the process on others.
+TCP_DATA_TYPES = ("raw", "beast", "skysense")
+
+# pyModeS releases before 2.18 crash unpacking their own nuc_p()/nuc_v().
+MIN_PYMODES_VERSION = (2, 18)
+
+
+def _pymodes_version() -> Optional[str]:
+    """Return the installed pyModeS version, or None if it is unknown."""
+    try:
+        return importlib.metadata.version("pyModeS")
+    except Exception:  # NOQA pylint: disable=broad-except
+        return None
+
+
+def _pymodes_error() -> Optional[str]:
+    """Return why pyModeS cannot decode TCP feeds, or None if it can.
+
+    ADSBNetWorker needs the pyModeS 2.x streamer API, which pyModeS 3 removed;
+    an installed-but-v3 pyModeS passes a plain import check and then fails at
+    the first message, so import the modules that are actually used.
+    """
+    try:
+        importlib.import_module("pyModeS.streamer.decode")
+        importlib.import_module("pyModeS.streamer.source")
+    except Exception as exc:  # NOQA pylint: disable=broad-except
+        return str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+
+    version = _pymodes_version()
+    if version:
+        release = tuple(int(part) for part in re.findall(r"\d+", version)[:2])
+        if release < MIN_PYMODES_VERSION:
+            return f"pyModeS {version} is installed, 2.18 or newer is required"
+    return None
+
+
+def sensor_beacon_enabled(config: Config) -> bool:
     """Return whether the periodic receiver beacon is enabled."""
     value = config.get("SENSOR_BEACON", "1")
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def create_tasks(config: SectionProxy, clitool: pytak.CLITool) -> Set[pytak.Worker,]:
+def create_tasks(
+    config: SectionProxy, clitool: pytak.CLITool
+) -> Set[pytak.Worker]:
     """Create specific coroutine task set for this application.
 
     Parameters
@@ -84,26 +166,28 @@ def create_tasks(config: SectionProxy, clitool: pytak.CLITool) -> Set[pytak.Work
     feed_url: ParseResult = urlparse(config.get("FEED_URL", ""))
 
     # ADS-B Workers (receivers):
-    if feed_url.scheme in ["http", "file", "ws", "wss"]:
+    if feed_url.scheme in ["http", "https", "file", "ws", "wss"]:
         # HTTP, WebSocket, or file-based input:
         tasks.add(adsbcot.ADSBWorker(clitool.tx_queue, config))
     elif "tcp" in feed_url.scheme:
-        if importlib.util.find_spec("pyModeS") is None:
-            warnings.warn(
-                (
-                    f"Please reinstall {APP_NAME} with pyModeS support:"
-                    f"$ python3 -m pip install {APP_NAME}[with_pymodes]"
-                ),
-                ImportWarning,
+        pymodes_error = _pymodes_error()
+        if pymodes_error is not None:
+            raise ValueError(
+                f"FEED_URL={_feed_url} needs pyModeS 2.x ({pymodes_error}). "
+                f"Install it with: python3 -m pip install '{APP_NAME}[with_pymodes]' "
+                "or: python3 -m pip install 'pymodes>=2.18,<3'"
             )
-            raise ValueError
 
-        net_queue: asyncio.Queue = asyncio.Queue()
+        net_queue: "asyncio.Queue[bytes]" = asyncio.Queue()
 
-        if "+" in feed_url.scheme:
-            _, data_type = feed_url.scheme.split("+")
-        else:
-            data_type = "raw"
+        _, _, data_type = feed_url.scheme.partition("+")
+        data_type = data_type or "raw"
+        if data_type not in TCP_DATA_TYPES:
+            raise ValueError(
+                f"Unsupported FEED_URL={_feed_url}: TCP feeds must be "
+                "tcp:// (raw), tcp+raw://, tcp+beast:// or tcp+skysense:// "
+                "(raw, beast or skysense)"
+            )
 
         tasks.add(adsbcot.ADSBNetReceiver(net_queue, config, data_type))
 
@@ -116,9 +200,9 @@ def create_tasks(config: SectionProxy, clitool: pytak.CLITool) -> Set[pytak.Work
 
 
 def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,too-many-statements
-    craft: dict,
-    config: Union[SectionProxy, dict, None] = None,
-    known_craft: Optional[dict] = None,
+    craft: Dict[str, Any],
+    config: Optional[Config] = None,
+    known_craft: Optional[Dict[str, Any]] = None,
 ) -> Optional[ET.Element]:
     """
     Serialize ADS-B data as Cursor on Target.
@@ -142,8 +226,8 @@ def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,t
     if lastPosition:
         craft.update(lastPosition)
 
-    lat = craft.get("lat", craft.get("Lat"))
-    lon = craft.get("lon", craft.get("Lon", craft.get("Lng")))
+    lat = _first(craft, "lat", "Lat")
+    lon = _first(craft, "lon", "Lon", "Lng")
 
     if lat is None or lon is None:
         Logger.warning(f"No value for lat={lat} lon={lon}")
@@ -164,29 +248,24 @@ def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,t
 
     # Stratux reports Icao_addr as an int:
     icao_addr: str = aircot.icao_int_to_hex(
-        craft.get("icao_addr", craft.get("Icao_addr", 0))
+        _first(craft, "icao_addr", "Icao_addr", default=0)
     )
-    icao_hex: str = str(craft.get("hex", craft.get("icao", icao_addr))).strip().upper()
+    icao_hex: str = _text(_first(craft, "hex", "icao", default=icao_addr))
 
-    _flight = craft.get("flight", craft.get("Tail", ""))
-    flight: str = str(_flight).strip().upper()
-
-    _reg = craft.get("reg", craft.get("r", craft.get("Reg", "")))
-    reg: str = str(_reg).strip().upper()
-
-    _cat = craft.get("cat", craft.get("Category", craft.get("category", "")))
-    cat: str = str(_cat).strip().upper()
-
-    _squawk = craft.get("squawk", craft.get("Squawk", ""))
-    squawk: str = str(_squawk).strip().upper()
-
-    _type = craft.get("t", craft.get("TargetType", 0))
-    craft_type: str = str(_type).strip().upper()
+    flight: str = _text(_first(craft, "flight", "Tail"))
+    reg: str = _text(_first(craft, "reg", "r", "Reg"))
+    cat: str = _text(_first(craft, "cat", "Category", "category"))
+    squawk: str = _text(_first(craft, "squawk", "Squawk"))
+    craft_type: str = _text(_first(craft, "t", "TargetType"))
+    # Stratux reports the ADS-B target type as an int, see TARGET_TYPE_NAMES.
+    target_type = craft.get("TargetType")
+    # Model description, e.g. "AIRBUS A-320", from readsb-based APIs (#60).
+    desc: str = _text(craft.get("desc"))
 
     alt_upper: int = int(config.get("ALT_UPPER", "0"))
     alt_lower: int = int(config.get("ALT_LOWER", "0"))
 
-    alt_geom = craft.get("alt_geom")
+    alt_geom = _number(craft.get("alt_geom"))
 
     if alt_geom:
         remarks_fields.append(f"Alt:{craft.get('alt_geom')}")
@@ -230,40 +309,32 @@ def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,t
         remarks_fields.append(f"Cat.: {cat}")
         __adsb.set("cat", cat)
 
+    if desc:
+        remarks_fields.append(desc)
+        __adsb.set("desc", desc)
+
     if craft_type:
         __adsb.set("craft_type", str(craft_type))
         remarks_fields.append(f"Type:{craft_type}")
 
-        craft_type_name: Union[str, None] = None
-        if craft_type == 0:
-            craft_type_name = "Mode S"
-        elif craft_type == 1:
-            craft_type_name = "ADS-B"
-        elif craft_type == 2:
-            craft_type_name = "ADS-R"
-        elif craft_type == 3:
-            craft_type_name = "TIS-B S"
-            tisb = True
-        elif craft_type == 4:
-            craft_type_name = "TIS-B"
-            tisb = True
+        craft_type_name = (
+            TARGET_TYPE_NAMES.get(target_type) if isinstance(target_type, int) else None
+        )
         if craft_type_name:
-            remarks_fields.append(f"ADS-B Type: {craft_type}")
-            __adsb.set("craft_type", craft_type)
+            tisb = craft_type_name.startswith("TIS-B")
+            remarks_fields.append(f"ADS-B Type: {craft_type_name}")
 
     cot_uid: str = ""
     if "REG" in uid_key and reg:
         cot_uid = f"REG-{reg}"
-    elif "ICAO" in uid_key and icao_hex:
-        cot_uid = f"ICAO-{icao_hex}"
-    if "FLIGHT" in uid_key and flight:
+    elif "FLIGHT" in uid_key and flight:
         cot_uid = f"FLIGHT-{flight}"
     elif icao_hex:
         cot_uid = f"ICAO-{icao_hex}"
     elif flight:
         cot_uid = f"FLIGHT-{flight}"
     else:
-        Logger.warning(f"cot_uid={cot_uid}")
+        Logger.warning("No ICAO, flight or UID_KEY=REG registration for craft")
         return None
 
     if flight:
@@ -279,13 +350,16 @@ def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,t
 
     cat = aircot.set_category(cat, known_craft)
 
-    if tisb:
-        cot_type = "a-u-A"
+    if tisb or not icao_hex:
+        # aircot derives the type from the ICAO address and cannot parse ""
+        cot_type = known_craft.get("COT") or "a-u-A"
     else:
         cot_type = aircot.set_cot_type(icao_hex, category, flight, known_craft)
 
-    nac_p = craft.get("NACp", craft.get("nac_p", 0.0))
-    nac_v = craft.get("NACv", craft.get("nac_v", nac_p))
+    nac_p = _number(_first(craft, "NACp", "nac_p")) or 0.0
+    nac_v = _number(_first(craft, "NACv", "nac_v"))
+    if nac_v is None:
+        nac_v = nac_p
 
     if craft.get("OnGround"):
         ground_const = 51.56
@@ -294,7 +368,7 @@ def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,t
         ground_const = 56.57
         # Multiply alt_geom by "Clarke 1880 (international foot)"
         hae = aircot.functions.get_hae(
-            craft.get("Alt", craft.get("alt_geom", craft.get("alt_geom_x")))
+            _number(_first(craft, "Alt", "alt_geom", "alt_geom_x"))
         )
 
     ce = str(float(nac_p) + ground_const)
@@ -308,19 +382,16 @@ def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,t
 
     track: ET.Element = ET.Element("track")
 
-    course = craft.get(
-        "trk", craft.get("track", craft.get("Track", pytak.DEFAULT_COT_VAL))
-    )
+    course = _first(craft, "trk", "track", "Track", default=pytak.DEFAULT_COT_VAL)
     track.set("course", str(course))
 
-    _speed = craft.get("gs", craft.get("Speed", 0.0))
-    speed = aircot.functions.get_speed(_speed)
+    speed = aircot.functions.get_speed(_number(_first(craft, "gs", "Speed")))
     track.set("speed", str(speed))
 
     track.set("slope", str(craft.get("Vvel", pytak.DEFAULT_COT_VAL)))
 
     _radio = ET.Element("_radio")
-    _signal = craft.get("SignalLevel", craft.get("rssi"))
+    _signal = _first(craft, "SignalLevel", "rssi")
     if _signal:
         __adsb.set("signalLevel", str(_signal))
         _radio.set("signal", str(_signal))
@@ -366,16 +437,22 @@ def adsb_to_cot_xml(  # NOQA pylint: disable=too-many-locals,too-many-branches,t
 
 
 def gen_sensor_cot(
-    config=None, lat: float = 0.0, lon: float = 0.0, hae: float = 0.0,
-    ce: str = "9999999.0", le: str = "9999999.0",
-):
+    config: Optional[Config] = None,
+    lat: float = 0.0,
+    lon: float = 0.0,
+    hae: float = 0.0,
+    ce: str = "9999999.0",
+    le: str = "9999999.0",
+) -> Optional[ET.Element]:
     """Generate a periodic sensor beacon CoT (a-f-G-E-S-E)."""
     config = config or {}
     sensor_id = config.get("SENSOR_ID", adsbcot.DEFAULT_SENSOR_ID)
     cot_type = config.get("SENSOR_COT_TYPE", adsbcot.DEFAULT_SENSOR_COT_TYPE)
     cot_stale = int(config.get("COT_STALE", pytak.DEFAULT_COT_STALE))
-    callsign = config.get("SENSOR_CALLSIGN", sensor_id)
-    payload_type = config.get("SENSOR_PAYLOAD_TYPE", adsbcot.DEFAULT_SENSOR_PAYLOAD_TYPE)
+    callsign = str(config.get("SENSOR_CALLSIGN", sensor_id))
+    payload_type = config.get(
+        "SENSOR_PAYLOAD_TYPE", adsbcot.DEFAULT_SENSOR_PAYLOAD_TYPE
+    )
 
     contact = ET.Element("contact")
     contact.set("callsign", callsign)
@@ -396,9 +473,9 @@ def gen_sensor_cot(
 
 
 def adsb_to_cot(
-    craft: dict,
-    config: Union[SectionProxy, dict, None] = None,
-    known_craft: Optional[dict] = None,
+    craft: Dict[str, Any],
+    config: Optional[Config] = None,
+    known_craft: Optional[Dict[str, Any]] = None,
 ) -> Optional[bytes]:
     """Return CoT XML object as an XML string."""
     cot: Optional[ET.Element] = adsb_to_cot_xml(craft, config, known_craft)

@@ -14,7 +14,9 @@ For detailed documentation, visit the [official documentation](https://adsbcot.r
 - Supports multiple ADS-B data aggregators.
 - Supports COTS ADS-B hardware receivers.
 - Supports over-the-air RF ADS-B data via SDR.
-- Runs on Python 3.7+ in both Windows and Linux environments.
+- Reads JSON over HTTP(S), WebSockets and local files, and raw / Beast Mode S
+  over TCP.
+- Runs on Python 3.9+ in both Windows and Linux environments.
 
 ### Supported ADS-B Aggregators
 
