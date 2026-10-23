@@ -4,16 +4,14 @@ There are several methods of installing ADSBCOT. They are listed below, in order
 
 ## Debian, Ubuntu, Raspberry Pi
 
-Install ADSBCOT, and prerequisite packages of [PyTAK](https://pytak.rtfd.io) & [AIRCOT](https://aircot.rtfd.io).
+Install from the signed snstac apt repository (PyTAK & AIRCOT resolve
+automatically):
 
 ```sh linenums="1"
+sudo curl -fsSL -o /usr/share/keyrings/snstac.gpg https://snstac.github.io/packages/snstac.gpg
+sudo curl -fsSL -o /etc/apt/sources.list.d/snstac.sources https://snstac.github.io/packages/snstac.sources
 sudo apt update -qq
-wget https://github.com/snstac/aircot/releases/latest/download/aircot_latest_all.deb
-sudo apt install -f ./aircot_latest_all.deb
-wget https://github.com/snstac/pytak/releases/latest/download/pytak_latest_all.deb
-sudo apt install -f ./pytak_latest_all.deb
-wget https://github.com/snstac/adsbcot/releases/latest/download/adsbcot_latest_all.deb
-sudo apt install -f ./adsbcot_latest_all.deb
+sudo apt install adsbcot
 ```
 
 > **N.B.** This installation method only supports `http://` & `file://` based ADS-B data feeds. To use TCP raw (AVR) or TCP binary Beast feeds, you'll need to install pyModeS, see below.
@@ -54,7 +52,8 @@ sudo python3 -m pip install adsbcot
 
 ## Docker
 
-Build the docker container.
+Build the docker container. The source repository is private (org members
+only). With access:
 
 ```sh linenums="1"
 git clone https://github.com/snstac/adsbcot.git
@@ -70,7 +69,7 @@ docker run -d -v /opt/docker/adsbcot/:/etc/adsbcot --name adsbcot adsbcot
 
 ## Developers
 
-PRs welcome!
+PRs welcome! The source repository is private (org members only). With access:
 
 ```sh linenums="1"
 git clone https://github.com/snstac/adsbcot.git
